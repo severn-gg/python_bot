@@ -3,7 +3,7 @@ import mysql.connector
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
-# Status per user untuk menentukan langkah
+# Status per user untuk menentukan langkah1
 user_state = {}
 
 # Konfigurasi koneksi database server
