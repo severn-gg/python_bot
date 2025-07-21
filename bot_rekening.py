@@ -1,12 +1,10 @@
 import re
 import mysql.connector
+from datetime import datetime
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
-# Status per user untuk menentukan langkah1
-user_state = {}
-
-# Konfigurasi koneksi database server
+# Konfigurasi database
 db_config = {
     'host': 'qh98k.h.filess.io',
     'port': 61002,
@@ -18,64 +16,127 @@ db_config = {
 def connect_db():
     return mysql.connector.connect(**db_config)
 
-# Validasi format rekening (contoh: 00002-02-00006)
-def is_valid_rekening(rekening: str) -> bool:
-    return bool(re.fullmatch(r"\d{5}-\d{2}-\d{5}", rekening))
+def is_valid_rekening(rek: str) -> bool:
+    return re.fullmatch(r"\d{5}-\d{2}-\d{5}", rek)
 
-# Handler /start
+def ensure_histori_table():
+    try:
+        conn = connect_db()
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS histori_cek_saldo (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                user_id BIGINT,
+                username VARCHAR(255),
+                account_number VARCHAR(20),
+                saldo INT,
+                waktu DATETIME
+            );
+        """)
+        conn.commit()
+        cursor.close()
+        conn.close()
+    except mysql.connector.Error as err:
+        print("Gagal membuat tabel histori:", err)
+
+# /start handler
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    user_state[user_id] = "awaiting_rekening"
-    await update.message.reply_text("Selamat datang!\nSilakan kirim nomor rekening Anda (format: 00000-00-00000).")
+    await update.message.reply_text(
+        "👋 Silakan kirim nomor rekening Anda (format: 00000-00-00000).",
+        parse_mode="Markdown"
+    )
 
-# Handler pesan biasa
+# /histori handler
+async def histori(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    try:
+        conn = connect_db()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT account_number, saldo, waktu FROM histori_cek_saldo
+            WHERE user_id = %s
+            ORDER BY waktu DESC LIMIT 5
+        """, (user_id,))
+        rows = cursor.fetchall()
+        if rows:
+            msg = "📜 Histori cek saldo terakhir:\n\n"
+            for row in rows:
+                rek, saldo, waktu = row
+                waktu_str = waktu.strftime("%d-%m-%Y %H:%M")
+                msg += f"• {rek} - Rp{saldo:,} ({waktu_str})\n"
+            await update.message.reply_text(msg, parse_mode="Markdown")
+        else:
+            await update.message.reply_text("📭 Belum ada histori cek saldo.")
+        cursor.close()
+        conn.close()
+    except mysql.connector.Error as err:
+        await update.message.reply_text(f"⚠️ Kesalahan saat akses histori:\n`{err}`", parse_mode="Markdown")
+
+# Handler untuk pesan biasa
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
     text = update.message.text.strip()
 
-    # Tahap awal jika user belum memulai
-    if user_id not in user_state:
-        user_state[user_id] = "awaiting_rekening"
-        await update.message.reply_text("Silakan kirim nomor rekening Anda (format: 00000-00-00000).")
+    if re.fullmatch(r"(?i)halo", text):
+        await update.message.reply_text(
+            "👋 Silakan kirim nomor rekening Anda (format: 00000-00-00000).",
+            parse_mode="Markdown"
+        )
         return
 
-    # Tahap pengisian rekening
-    if user_state[user_id] == "awaiting_rekening":
-        if not is_valid_rekening(text):
-            await update.message.reply_text("❌ Format salah. Gunakan: 00000-00-00000")
-            return
-
+    if is_valid_rekening(text):
+        rekening = text
         try:
             conn = connect_db()
             cursor = conn.cursor()
-
-            # Ambil saldo dari tabel Accounts
-            cursor.execute("SELECT saldo FROM Accounts WHERE account_number = %s", (text,))
+            cursor.execute("SELECT saldo FROM Accounts WHERE account_number = %s", (rekening,))
             result = cursor.fetchone()
 
             if result:
                 saldo = result[0]
-                await update.message.reply_text(f"✅ Rekening: {text}\n💰 Saldo Anda: Rp{saldo:,}")
-            else:
-                # Jika tidak ditemukan, bantu debug
-                cursor.execute("SELECT account_number FROM Accounts")
-                daftar = [row[0] for row in cursor.fetchall()]
-                daftar_joined = "\n".join(daftar)
-                await update.message.reply_text(f"ℹ️ Nomor rekening tidak ditemukan.\n📋 Tersedia:\n{daftar_joined}")
+                await update.message.reply_text(
+                    f"✅ Nomor Rekening: {rekening}\n💰 Saldo Anda: Rp{saldo:,}",
+                    parse_mode="Markdown"
+                )
 
-            user_state[user_id] = "done"
+                # Simpan histori
+                cursor.execute("""
+                    INSERT INTO histori_cek_saldo (user_id, username, account_number, saldo, waktu)
+                    VALUES (%s, %s, %s, %s, %s)
+                """, (
+                    update.effective_user.id,
+                    update.effective_user.username or "",
+                    rekening,
+                    saldo,
+                    datetime.now()
+                ))
+                conn.commit()
+
+                
+            else:
+                cursor.execute("SELECT account_number FROM Accounts")
+                daftar = [f"{row[0]}" for row in cursor.fetchall()]
+                daftar_joined = "\n".join(daftar)
+                await update.message.reply_text(
+                    f"❌ Nomor rekening tidak ditemukan.\n\n📋 Daftar tersedia:\n{daftar_joined}",
+                    parse_mode="Markdown"
+                )
             cursor.close()
             conn.close()
-
         except mysql.connector.Error as err:
-            await update.message.reply_text(f"⚠️ Terjadi kesalahan database:\n{err}")
+            await update.message.reply_text(f"⚠️ Terjadi kesalahan database:\n`{err}`", parse_mode="Markdown")
+        return
 
-# Main: Menjalankan aplikasi bot
+    await update.message.reply_text(
+        "⚠️ Format salah. Gunakan format: 00000-00-00000.",
+        parse_mode="Markdown"
+    )
+
+# MAIN
 if __name__ == '__main__':
+    ensure_histori_table()
     app = ApplicationBuilder().token("7760891685:AAHi4jFDuAjKtQ9uvf_Kr8QsUGcrNGYQUp8").build()
-
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("histori", histori))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    print("🤖 Bot sedang berjalan...")
+    print("🤖 Bot cek saldo aktif...")
     app.run_polling()
